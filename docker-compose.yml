@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis/redis-stack:latest
+    ports:
+      - "6379:6379"
+      - "8001:8001"  # RedisInsight web UI
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      BASE_PATH: /workspace
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface  # Persist HF model cache
+      - /Users/wenkhairu/Documents/Personal:/workspace  # Local projects mount
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+  mcp:
+    build: ./mcp
+    ports:
+      - "8002:8002"
+    environment:
+      APP_URL: http://app:8000
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8002
+    depends_on:
+      - app
+
+volumes:
+  redis_data:

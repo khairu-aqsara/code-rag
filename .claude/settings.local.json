@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk ls *)",
+      "WebSearch",
+      "Bash(rtk grep *)",
+      "Bash(sort -k5 -h)",
+      "Bash(~/.venv/bin/python -c \"import tokenizers; print\\('tokenizers:', tokenizers.__version__\\)\")",
+      "Bash(~/.venv/bin/python -c \"import transformers; print\\('transformers:', transformers.__version__\\)\")",
+      "Bash(rtk curl *)",
+      "Bash(python3 -m json.tool)",
+      "Bash(~/.venv/bin/python -m json.tool)",
+      "Bash(curl -s -X POST http://localhost:8000/api/search-code -H 'Content-Type: application/json' -d '{\"project_id\":\"code-rag\",\"query\":\"embedding model CLS pooling\",\"k\":3,\"fields\":[\"name\",\"kind\",\"path_or_source\",\"start_line\",\"score\"]}')",
+      "Bash(curl -s -X POST http://localhost:8000/api/search-code-exact -H 'Content-Type: application/json' -d '{\"project_id\":\"code-rag\",\"query\":\"search_code_hybrid\",\"k\":3,\"fields\":[\"name\",\"kind\",\"path_or_source\",\"start_line\",\"score\"]}')",
+      "Bash(curl -s -X POST http://localhost:8002/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}')",
+      "Bash(curl -s -X POST http://localhost:8002/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"coderag_list_projects\",\"arguments\":{}}}')",
+      "Bash(curl -s -X POST http://localhost:8002/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"coderag_list_files\",\"arguments\":{\"project_id\":\"code-rag\"}}}')",
+      "Bash(curl -s -X POST http://localhost:8002/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"coderag_search_code_exact\",\"arguments\":{\"project_id\":\"code-rag\",\"query\":\"EmbeddingService\",\"k\":3,\"fields\":[\"name\",\"kind\",\"path_or_source\",\"start_line\"]}}}')"
+    ]
+  }
+}

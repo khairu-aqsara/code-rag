@@ -1,0 +1,823 @@
+# code-rag
+
+Local-first RAG (Retrieval-Augmented Generation) service for code and documentation indexing. No paid APIs — uses open-source Hugging Face models with Redis Stack for vector search.
+
+## Features
+
+### Core
+- **Code search**: gte-modernbert-base (768-dim) embeddings, KNN search via RediSearch HNSW
+- **Doc search**: gte-modernbert-base (768-dim) embeddings for text/markdown
+- **Unified embeddings**: Single 768-dim model handles both code and docs
+- **REST API**: FastAPI with auto-generated Swagger UI at `/docs`
+- **CLI**: Typer-based commands for ingestion and management
+- **Local-first**: Redis Stack + HF models run entirely on your machine
+- **No API keys**: All models are free public Hugging Face models
+
+### Advanced (Phases 1-5)
+
+**Phase 1: AST-Aware Chunking**
+- Extracts functions and classes as semantic units (vs arbitrary lines)
+- Preserves docstrings, signatures, context
+- 50-70% fewer chunks with better relevance
+
+**Phase 2: Intelligent Filtering & Deduplication**
+- Auto-skips test files (`test_*.py`, `*_test.py`, `*.min.js`, etc.)
+- Deduplicates identical chunks by MD5 hash
+- Tracks canonical file paths
+
+**Phase 3: Enhanced Search API with Rich Metadata**
+- Filter by `exclude_tests`, `exclude_paths`, `min_score`, `semantic_weight`
+- Returns function names, docstrings, kinds extracted from AST
+- Over-fetches to compensate for filtering
+
+**Phase 4: Hybrid Keyword + Semantic Search**
+- Dual indices: HNSW vectors + BM25 full-text
+- Find code by exact name ("authenticate_user") or by meaning ("user authentication")
+- Configurable `semantic_weight` (0.0 = keyword only, 1.0 = semantic only)
+
+**Phase 5: Signal-Based Result Re-Ranking**
+- Boosts non-test files, function/class definitions, query term matches
+- Combines embedding score with relevance signals
+- Smarter ranking without extra ML models
+
+## Quick Start
+
+### 1. Start Redis Stack
+
+```bash
+docker-compose up -d redis
+```
+
+### 2. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+# Or with test deps:
+pip install -e ".[test]"
+```
+
+### 3. Copy environment config
+
+```bash
+cp .env.example .env
+# Edit .env as needed (defaults work for local dev)
+```
+
+### 4. Start the API server
+
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+API available at `http://localhost:8000` — Swagger UI at `http://localhost:8000/docs`.
+
+**First startup** downloads ~300 MB of HF models (gte-modernbert-base, unified 768-dim embeddings). Cached at `~/.cache/huggingface/`. Subsequent starts use the cache.
+
+---
+
+## CLI Usage
+
+```bash
+# Ingest a code repository
+python -m src.cli ingest-code --project myproject --root ./src --lang python typescript
+
+# Ingest documentation (single path)
+python -m src.cli ingest-docs --project myproject --paths "docs/*.md" --tags api auth
+
+# Ingest documentation (multiple paths)
+python -m src.cli ingest-docs --project myproject --paths "docs/*.md" --paths "README.md" --tags api
+
+# Delete all data for a project
+python -m src.cli delete-project --project myproject
+
+# Show index statistics
+python -m src.cli stats
+```
+
+### Shell Alias
+
+Add these aliases to your `~/.bashrc` or `~/.zshrc` for shorter commands:
+
+```bash
+# Code ingestion
+alias rag-ingest="python -m src.cli ingest-code"
+alias rag-ingest-docs="python -m src.cli ingest-docs"
+
+# Project management
+alias rag-delete="python -m src.cli delete-project"
+alias rag-stats="python -m src.cli stats"
+
+# Example usage:
+# rag-ingest --project myproject --root ./src --lang python typescript
+# rag-ingest-docs --project myproject --paths "docs/*.md" --tags api
+# rag-delete --project myproject
+# rag-stats
+```
+
+After adding, reload your shell: `source ~/.zshrc` (or `source ~/.bashrc`).
+
+---
+
+## API Endpoints
+
+All endpoints are under `/api/`.
+
+### Search Endpoints
+
+#### `POST /api/search-code` (Phase 3)
+Semantic search for code with filtering and metadata.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authentication middleware",
+  "k": 10,
+  "lang_filter": ["python", "typescript"],
+  "exclude_tests": true,
+  "exclude_paths": ["migrations/", "vendor/"],
+  "min_score": 0.7
+}
+```
+
+**Response includes**: `name`, `kind`, `docstring`, `language` (extracted from AST). By default, null fields and the `metadata` object are omitted for token efficiency.
+
+#### `POST /api/search-docs` (Phase 3)
+Semantic search for documentation with filtering.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "how to authenticate",
+  "k": 5,
+  "tags": ["auth", "api"],
+  "exclude_sources": ["CHANGELOG.md"],
+  "min_score": 0.65
+}
+```
+
+#### `POST /api/search-hybrid` (Phase 3)
+Merges code + doc results via Reciprocal Rank Fusion.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authentication flow",
+  "k": 10,
+  "exclude_tests": true,
+  "min_score": 0.7
+}
+```
+
+#### `POST /api/search-code-hybrid` (Phase 4)
+**Hybrid keyword + semantic search** for code. Find by exact name OR by meaning.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authenticate_user",
+  "k": 10,
+  "exclude_tests": true,
+  "semantic_weight": 0.3
+}
+```
+
+- `semantic_weight: 0.0-0.3` → pure keyword (exact function name matches)
+- `semantic_weight: 0.5` → balanced search
+- `semantic_weight: 0.7-1.0` → pure semantic (concept search)
+
+#### `POST /api/search-docs-hybrid` (Phase 4)
+**Hybrid keyword + semantic search** for documentation.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authentication setup",
+  "k": 5,
+  "tags": ["auth"],
+  "semantic_weight": 0.6
+}
+```
+
+### Response Optimization
+
+All search endpoints accept two optional parameters to reduce token consumption for AI coding agents:
+
+#### `response_type`: `json` (default) | `json-full`
+
+| Mode | Null fields | `metadata` field | Token savings |
+|------|------------|------------------|---------------|
+| `json` (default) | Omitted | Omitted | ~14% vs old format |
+| `json-full` | Included as `null` | Included | Full backward compatibility |
+
+**Default (`json`)** — compact response, null fields omitted:
+```json
+{
+  "results": [
+    {
+      "score": 0.85,
+      "path_or_source": "/src/auth.py",
+      "content": "def authenticate_user(...)...",
+      "start_line": 42,
+      "end_line": 67,
+      "name": "authenticate_user",
+      "kind": "function",
+      "language": "python"
+    }
+  ]
+}
+```
+
+**Full (`json-full`)** — backward-compatible, all fields present:
+```json
+{
+  "results": [
+    {
+      "score": 0.85,
+      "path_or_source": "/src/auth.py",
+      "content": "def authenticate_user(...)...",
+      "start_line": 42,
+      "end_line": 67,
+      "name": "authenticate_user",
+      "kind": "function",
+      "docstring": null,
+      "language": "python",
+      "match_type": null,
+      "original_path": null,
+      "metadata": {"lang": "python", "project_id": "myproj", "name": "authenticate_user", "kind": "function"}
+    }
+  ]
+}
+```
+
+#### `fields`: Field Projection
+
+Request only the fields you need. Valid fields: `score`, `path_or_source`, `content`, `start_line`, `end_line`, `name`, `kind`, `docstring`, `language`, `match_type`, `original_path`, `last_indexed`.
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authenticate_user",
+  "fields": ["path_or_source", "content", "start_line", "end_line"]
+}
+```
+
+Response:
+```json
+{
+  "results": [
+    {
+      "path_or_source": "/src/auth.py",
+      "content": "def authenticate_user(...)...",
+      "start_line": 42,
+      "end_line": 67
+    }
+  ]
+}
+```
+
+This can save **30-50% tokens** when you only need location info (path + line numbers) and don't need `content`, `score`, or metadata.
+
+#### Combined Example
+
+```json
+{
+  "project_id": "myproject",
+  "query": "authenticate_user",
+  "k": 5,
+  "response_type": "json",
+  "fields": ["path_or_source", "start_line", "end_line", "name", "kind"]
+}
+```
+
+### Admin
+
+#### `GET /api/projects`
+List all projects that have indexed data, with per-project chunk counts.
+
+```json
+{
+  "total": 2,
+  "projects": [
+    {"project_id": "myproject", "code_chunks": 142, "doc_chunks": 37},
+    {"project_id": "anotherproject", "code_chunks": 89, "doc_chunks": 0}
+  ]
+}
+```
+
+Use this to discover available `project_id` values before running search queries.
+Results are sorted alphabetically. Uses `FT.AGGREGATE GROUPBY` — no keyspace scan.
+
+#### `GET /api/projects/{project_id}/info`
+Get detailed project statistics including chunk counts, languages, and doc tags.
+
+```bash
+curl "http://localhost:8000/api/projects/myproject/info"
+```
+
+```json
+{
+  "project_id": "myproject",
+  "code_chunks": 142,
+  "doc_chunks": 37,
+  "last_indexed": "1715334000",
+  "index_age_days": 4,
+  "languages": ["python", "typescript"],
+  "doc_tags": ["api", "auth"]
+}
+```
+
+#### `POST /api/search-batch`
+Execute multiple search queries in a single request. Useful for AI agents that need to run several related searches efficiently.
+
+```bash
+curl -X POST http://localhost:8000/api/search-batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "myproject",
+    "queries": [
+      {"type": "code_exact", "query": "authenticate_user"},
+      {"type": "code_hybrid", "query": "user authentication flow", "semantic_weight": 0.7},
+      {"type": "docs", "query": "auth API"}
+    ],
+    "k": 5,
+    "fields": ["path_or_source", "name", "kind"]
+  }'
+```
+
+```json
+{
+  "results": {
+    "query_0": [{"path_or_source": "/src/auth.py", "name": "authenticate_user", "kind": "function"}],
+    "query_1": [{"path_or_source": "/src/auth.py", "name": "AuthMiddleware", "kind": "class"}],
+    "query_2": [{"path_or_source": "docs/api.md", "name": null, "kind": null}]
+  }
+}
+```
+
+Valid query types: `code`, `code_exact`, `code_hybrid`, `docs`, `docs_hybrid`.
+
+#### `PUT /api/config/default-project`
+Set the default project_id for a workspace. Useful for single-project setups to skip project confirmation.
+
+```bash
+curl -X PUT http://localhost:8000/api/config/default-project \
+  -H "Content-Type: application/json" \
+  -d '{"workspace": "my-machine", "project_id": "myproject"}'
+```
+
+```json
+{"status": "success", "workspace": "my-machine", "project_id": "myproject"}
+```
+
+#### `GET /api/config/default-project`
+Get the configured default project_id for a workspace.
+
+```bash
+curl "http://localhost:8000/api/config/default-project?workspace=my-machine"
+```
+
+```json
+{"status": "success", "workspace": "my-machine", "project_id": "myproject"}
+```
+
+#### `POST /api/projects/{project_id}/ingest-code`
+```json
+{
+  "root_path": "/data/myrepo",
+  "lang_filter": ["python", "php"],
+  "skip_patterns": ["tests", "migrations"]
+}
+```
+
+#### `POST /api/projects/{project_id}/ingest-docs`
+```json
+{
+  "file_paths": ["/data/docs/*.md", "/data/README.md"],
+  "tags": ["docs", "v2"]
+}
+```
+
+#### `DELETE /api/projects/{project_id}`
+Delete all indexed data for a project.
+
+#### `GET /api/health`
+```json
+{"status": "ok", "redis_ok": true, "models_loaded": true}
+```
+
+#### `GET /api/stats`
+Returns RediSearch index statistics.
+
+---
+
+## Docker Compose (Full Stack)
+
+```bash
+docker-compose up
+```
+
+Starts all services:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| `redis` | `6379` | Redis Stack (HNSW vector store) |
+| `redis` | `8001` | RedisInsight web UI (optional) |
+| `app` | `8000` | FastAPI REST API (loads gte-modernbert-base model) |
+| `mcp` | `8002` | MCP server (stateless HTTP proxy, no model loading) |
+
+HF model cache is volume-mounted from `~/.cache/huggingface` to persist across restarts.
+
+**RedisInsight** (optional UI): `http://localhost:8001`
+
+---
+
+## MCP Server
+
+The MCP server at `http://localhost:8002/mcp` exposes all search and admin capabilities as [Model Context Protocol](https://modelcontextprotocol.io) tools. It is a stateless HTTP proxy — no ML models are loaded in this container. All inference happens in the `app` container.
+
+### Connecting a client
+
+**Claude Desktop / Cursor** — add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "code-rag": {
+      "url": "http://localhost:8002/mcp"
+    }
+  }
+}
+```
+
+**OpenCode** — add to `~/.config/opencode/config.json`:
+
+```json
+{
+  "mcp": {
+    "code-rag": {
+      "type": "http",
+      "url": "http://localhost:8002/mcp"
+    }
+  }
+}
+```
+
+### MCP Tools
+
+All tools are prefixed `coderag_` to avoid conflicts when used alongside other MCP servers.
+
+#### Discovery tools (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `coderag_list_projects` | List all projects with indexed data and per-project chunk counts — **always call this first** |
+| `coderag_list_files` | List all indexed file paths for a project — optional prefix filter to narrow to a directory |
+| `coderag_find_symbols` | Find symbol definitions by name and/or kind (`function`, `class`) using BM25 TAG index |
+| `coderag_get_project_info` | Get detailed project stats (chunk counts, languages, tags, index age) |
+
+#### Search tools (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `coderag_search_code` | Semantic code search via gte-modernbert-base (768-dim) HNSW index |
+| `coderag_search_code_hybrid` | Keyword + semantic code search (BM25 + HNSW) — default `semantic_weight=0.3` (keyword-dominant) |
+| `coderag_search_code_exact` | Fast exact/keyword-only code search (BM25, no embedding) — use for exact function/class names |
+| `coderag_search_docs` | Semantic documentation search via gte-modernbert-base (768-dim) HNSW index |
+| `coderag_search_docs_hybrid` | Keyword + semantic documentation search (BM25 + HNSW) |
+| `coderag_search_hybrid` | Cross-modal search across code + docs (unified 768-dim embeddings, merged via RRF) |
+| `coderag_search_batch` | Execute multiple search queries in a single request |
+
+#### Configuration tools
+
+| Tool | Description |
+|------|-------------|
+| `coderag_set_default_project` | Set default project_id for a workspace (write) |
+| `coderag_get_default_project` | Get default project_id for a workspace (read-only) |
+
+#### Admin tools (read-only)
+
+| Tool | Description |
+|------|-------------|
+| `coderag_get_health` | Check Redis connection and ML model load status |
+| `coderag_get_stats` | RediSearch index statistics for all 4 indices |
+
+### Transport
+
+The MCP server uses **Streamable HTTP** (the current MCP standard, not the deprecated SSE transport). The endpoint is `http://localhost:8002/mcp`.
+
+### MCP environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APP_URL` | `http://app:8000` | URL of the code-rag API (set automatically in Docker) — loads gte-modernbert-base on startup |
+| `MCP_HOST` | `0.0.0.0` | Bind host for the MCP server |
+| `MCP_PORT` | `8002` | Port for the MCP server (stateless proxy, no model loading) |
+
+### Readiness
+
+On first startup, the `app` container downloads ~300 MB of the gte-modernbert-base model before searches will work. Call `coderag_get_health` to check:
+
+```json
+{"status": "ok", "redis_ok": true, "models_loaded": true}
+```
+
+If `models_loaded` is `false`, wait and retry — the MCP server itself starts in seconds but searches will fail until the `app` is ready. Unified embedding model loads in ~5-15s on first run, cached thereafter.
+
+---
+
+## AI Coding Agent Integration
+
+To make any AI coding agent (Claude Desktop, Cursor, OpenCode, etc.) automatically search your indexed codebase before answering user questions, add an instruction to the agent's system prompt or configuration.
+
+### Required Agent Workflow
+
+Every agent using this MCP **must** follow this workflow before searching:
+
+```
+STEP 1 — Discover projects:
+  Call coderag_list_projects to get all available project IDs and chunk counts.
+
+STEP 2 — Confirm with the user:
+  If multiple projects exist, ask the user: "Which project should I search?
+  Available projects: [list from step 1]"
+  If only one project exists, confirm: "I'll search the '[project_id]' project. Proceed?"
+  Do NOT skip this step or assume a project_id.
+
+STEP 3 — Search:
+  Use the confirmed project_id for all subsequent search calls.
+```
+
+Add this instruction to your agent's configuration:
+
+```
+Before answering any question about the codebase, you MUST:
+1. Call coderag_list_projects to find all available projects
+2. Ask the user to confirm which project to search — never assume a project_id
+3. Then search using the confirmed project_id:
+   - Exact name lookup → coderag_search_code_exact or coderag_find_symbols
+   - Concept/intent query → coderag_search_code or coderag_search_code_hybrid
+   - Mixed code + docs → coderag_search_hybrid
+4. Optionally call coderag_list_files to understand the project file structure
+5. Only then provide your answer based on the search results
+
+Never assume you know the project_id or the codebase without confirming first.
+```
+
+### Per-Project Setup
+
+For agents that support project-specific instructions, use this pattern:
+
+```
+For this project, before answering any question:
+1. Call coderag_list_projects and confirm the project_id with the user
+2. Call coderag_search_hybrid with the confirmed project_id and the user's question as the query
+3. Use the returned file paths and line numbers to find the relevant code
+4. Cite specific files and functions in your answer
+```
+
+### Claude Desktop
+
+Add to your `CLAUDE.md` in the project root:
+
+```markdown
+# Codebase Context
+
+Before answering any question about this project, you MUST:
+
+1. Call `coderag_list_projects` to discover available project IDs
+2. Ask the user to confirm which project to search (do not assume)
+3. Call `coderag_search_hybrid` or `coderag_search_code` with the confirmed project_id
+4. Cite the specific files and line numbers returned in your answer
+
+Never skip the confirmation step — multiple projects may be indexed.
+```
+
+### OpenCode
+
+Add to `~/.config/opencode/system-prompt` or project-specific instructions:
+
+```
+You have access to code-rag MCP tools. Before answering any question about the codebase:
+1. Call coderag_list_projects to see all available projects
+2. Ask the user which project to search — never assume the project_id
+3. Search using the confirmed project_id with coderag_search_hybrid or coderag_search_code
+Never answer from memory — always confirm the project and verify with the search tool first.
+```
+
+### Cursor
+
+Add to `.cursorrules` or `.cursor/rules/` directory:
+
+```
+## Codebase Search
+
+Before answering any question:
+1. Call coderag_list_projects to find available projects
+2. Ask the user to confirm which project to search
+3. Use coderag_search_code_exact for exact names, coderag_search_code for concepts
+4. Cite specific file paths and line numbers in your answers
+Never assume a project_id without asking the user first.
+```
+
+### Why This Matters
+
+Without this instruction, AI agents will often:
+- Assume a `project_id` that doesn't exist and get empty results
+- Answer from incomplete memory or training data
+- Miss recent changes to the codebase
+- Search the wrong project when multiple are indexed
+
+By requiring project discovery and user confirmation first, you ensure every answer is grounded in the correct, up-to-date indexed codebase.
+
+### Search Tool Selection Guide
+
+| Query Type | Recommended Tool | Why |
+|------------|------------------|-----|
+| Exact function/class name | `coderag_search_code_exact` or `coderag_find_symbols` | BM25 is faster and more precise for identifiers |
+| Exact variable/module name | `coderag_find_symbols` with `kind=variable` | Uses TAG index on name field |
+| Concept/intent ("how does auth work") | `coderag_search_code_hybrid` with `semantic_weight=0.7` | Semantic search finds related code |
+| "Where is X implemented?" | `coderag_search_code_exact` | Fast exact match |
+| "Explain the auth flow" | `coderag_search_hybrid` | Cross-modal (code + docs) |
+| Technical question about docs | `coderag_search_docs` or `coderag_search_docs_hybrid` | Searches documentation index |
+| Don't know where answer is | `coderag_search_hybrid` | Searches both code and docs |
+| Need file structure | `coderag_list_files` | Returns indexed file paths |
+
+### Query Pattern Examples
+
+- Find exact function: `coderag_find_symbols(project_id="myproject", name="authenticate_user", kind="function")`
+- Find all classes in a module: `coderag_find_symbols(project_id="myproject", kind="class", k=20)`
+- Concept search: `coderag_search_code_hybrid(project_id="myproject", query="user authentication flow", semantic_weight=0.7)`
+- Fast keyword search: `coderag_search_code_exact(project_id="myproject", query="getUserById")`
+
+### Using Default Project Configuration
+
+For single-project setups, configure a default workspace to skip project confirmation:
+
+```bash
+# Set default project for your workspace
+curl -X PUT http://localhost:8000/api/config/default-project \
+  -H "Content-Type: application/json" \
+  -d '{"workspace": "my-machine", "project_id": "myproject"}'
+
+# Then agents can search without specifying project_id
+```
+
+MCP tools:
+- `coderag_set_default_project(workspace, project_id)` — Configure default
+- `coderag_get_default_project(workspace)` — Check current default
+
+---
+
+## Configuration
+
+All settings are loaded from environment variables or `.env`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_HOST` | `localhost` | Redis hostname |
+| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_PASSWORD` | `None` | Redis password (optional) |
+| `EMBED_MODEL` | `Alibaba-NLP/gte-modernbert-base` | gte-modernbert-base unified model, 768-dim |
+| `EMBED_DIM` | `768` | Embedding vector dimension (unified for code and text) |
+| `EMBED_MAX_LENGTH` | `2048` | Max tokens per embedding (model max 8192; default 2048 balances CPU performance vs context coverage) |
+| `EMBED_BATCH_SIZE` | `32` | Embedding batch size |
+| `CODE_CHUNK_LINES` | `80` | Lines per code chunk (Phase 1: uses AST by default) |
+| `CODE_OVERLAP_LINES` | `20` | Overlap between chunks |
+| `DOC_CHUNK_SIZE` | `512` | Approximate tokens per doc chunk |
+| `DEFAULT_TOP_K` | `10` | Default search result count |
+| `MAX_TOP_K` | `50` | Maximum allowed K in search requests |
+| `SKIP_FILES` | `*.test.py,*_test.py,test_*.py,conftest.py,*.min.js,*.min.css,*.map` | **Phase 2**: File patterns to skip during ingestion |
+| `BASE_PATH` | `/data` | Allowed root for ingest paths (security) |
+| `API_HOST` | `0.0.0.0` | API bind host |
+| `API_PORT` | `8000` | API port |
+| `HF_HOME` | `~/.cache/huggingface` | Hugging Face cache dir |
+| `TRANSFORMERS_OFFLINE` | unset | Set to `1` to disable HF downloads |
+
+---
+
+## Testing
+
+```bash
+# Unit tests (no external deps — fast)
+pytest -m "not integration"
+
+# Integration tests (requires Docker + Redis Stack)
+pytest -m integration
+
+# All tests
+pytest
+```
+
+Unit tests mock the embedder and vector store — no Redis or model downloads needed.
+
+Integration tests spin up a real `redis/redis-stack` container via `testcontainers`.
+
+---
+
+## Architecture
+
+```
+HTTP API (FastAPI)
+  /search-code  /search-docs  /search-hybrid
+  /search-code-hybrid  /search-docs-hybrid  /search-batch
+  /config/default-project  /projects/{id}/info  /health  /stats
+         ↓
+  VectorStore (RediSearch HNSW + BM25)
+    idx:code (HNSW, DIM=768, COSINE) + idx:code_bm25 (full-text)
+    idx:docs (HNSW, DIM=768, COSINE) + idx:docs_bm25 (full-text)
+         ↓
+  EmbeddingService + SignalRanker (Phase 5)
+    gte-modernbert-base → 768-dim unified embeddings (code and text)
+    SignalRanker: re-rank by non-test files, definitions, query matches
+         ↓
+  Ingestors (Phase 1-2)
+    CodeIngestor: AST chunking, file filtering, MD5 deduplication
+    DocIngestor:  glob files, strip HTML, chunk by paragraphs, embed, insert
+```
+
+**Key design decisions:**
+
+- **Phase 1 — AST-aware chunking**: Extract functions/classes as semantic units to preserve context
+- **Phase 2 — Content deduplication**: MD5-based deterministic Redis keys prevent duplicate chunks
+- **Phase 3 — Rich metadata**: Extract and return function names, docstrings, kinds from AST
+- **Unified embeddings**: Single gte-modernbert-base 768-dim model handles both code and text, enabling comparable similarity scores across content types
+- **Phase 4 — Dual indices**: Both HNSW (semantic) and BM25 (keyword) run in parallel; merge with `semantic_weight`
+- **Phase 5 — Signal-based re-ranking**: Boost by relevance signals (non-test +1, definition +1, query match +1)
+- `api/deps.py` breaks circular imports between `api/main.py` and router files
+- `SCAN` cursor iteration (never `KEYS`) for non-blocking Redis operations
+- `decode_responses=False` on Redis client — embedding vectors must remain bytes
+- Reciprocal Rank Fusion (RRF) for `/search-hybrid` — 768-dim unified embeddings produce comparable scores; RRF merges different content types
+- Lazy embedder loading in CLI — `stats`/`delete` skip the 5-15s model load
+
+---
+
+## Usage Examples
+
+### Example 1: Find by Exact Function Name (Phase 4)
+```bash
+curl -X POST http://localhost:8000/api/search-code-hybrid \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "myproject",
+    "query": "authenticate_user",
+    "k": 5,
+    "semantic_weight": 0.2,
+    "exclude_tests": true
+  }'
+```
+With `semantic_weight=0.2`, keyword search dominates → finds exact function name matches.
+
+### Example 2: Find by Semantic Meaning (Phase 4)
+```bash
+curl -X POST http://localhost:8000/api/search-code-hybrid \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "myproject",
+    "query": "user authentication mechanism",
+    "k": 5,
+    "semantic_weight": 0.9,
+    "exclude_tests": true
+  }'
+```
+With `semantic_weight=0.9`, semantic search dominates → finds conceptually related code.
+
+### Example 3: Filtered Search with Metadata (Phase 3)
+```bash
+curl -X POST http://localhost:8000/api/search-code \
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "myproject",
+    "query": "authentication",
+    "k": 10,
+    "exclude_tests": true,
+    "exclude_paths": ["migrations/", "vendor/"],
+    "min_score": 0.7,
+    "lang_filter": ["python"]
+  }'
+```
+Response includes rich metadata (null fields omitted by default):
+```json
+{
+  "results": [
+    {
+      "score": 0.85,
+      "path_or_source": "/src/auth.py",
+      "content": "def authenticate_user(...)...",
+      "start_line": 42,
+      "end_line": 67,
+      "name": "authenticate_user",
+      "kind": "function",
+      "docstring": "Authenticate user credentials.",
+      "language": "python"
+    }
+  ]
+}
+```
+
+## Supported Languages (Code Ingestion)
+
+Python, JavaScript, TypeScript, PHP, Ruby, Go, Java, Rust, C/C++, C#, Swift, Kotlin, Scala, Bash, SQL, HTML, CSS.
+
+## Supported Doc Formats
+
+`.md`, `.txt`, `.rst`, `.html`

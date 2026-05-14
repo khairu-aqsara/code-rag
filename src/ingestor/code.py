@@ -4,7 +4,9 @@ import os
 import time
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
+
+import torch
 
 from ..chunker import CodeChunk, CodeChunker
 from ..chunker_ast import ASTChunkerFactory
@@ -13,6 +15,10 @@ from ..config import settings
 if TYPE_CHECKING:
     from ..embedder import EmbeddingService
     from ..vector_store import VectorStore
+
+# Dedup set size cap. A set of hex-digest strings uses ~60 bytes/entry → 200k ≈ 12 MB max.
+# Beyond the cap, new chunks are treated as unique (may re-index a duplicate, harmless).
+_MAX_DEDUP_CACHE = 200_000
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +121,7 @@ class CodeIngestor:
         root_path: str,
         lang_filter: Optional[List[str]] = None,
         skip_patterns: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str, int], None]] = None,
     ) -> IngestResult:
         """Walk root_path, chunk and embed code files, insert into Redis.
 
@@ -131,8 +138,8 @@ class CodeIngestor:
         skipped_files = 0
         duplicate_chunks = 0
         errors: List[str] = []
-        # Map chunk hash → canonical (first-seen) file path for original_path tracking
-        seen_hashes: Dict[str, str] = {}
+        # Set of chunk hashes seen so far — values omitted (vs Dict) to halve memory use.
+        seen_hashes: set[str] = set()
 
         for dirpath, dirnames, filenames in os.walk(root_path):
             # Prune skip dirs in-place (modifies dirnames to prevent recursion)
@@ -166,63 +173,79 @@ class CodeIngestor:
 
                 # Try AST-aware chunking first, fall back to line-based
                 ast_chunker = ASTChunkerFactory.get_chunker(lang)
-                if ast_chunker:
-                    try:
-                        chunks = ast_chunker.chunk_file(content, file_path)
-                    except Exception as e:
-                        logger.debug(f"AST chunking failed for {file_path}, falling back to line-based: {e}")
+                try:
+                    if ast_chunker:
+                        try:
+                            chunks = ast_chunker.chunk_file(content, file_path)
+                        except Exception as e:
+                            logger.debug(f"AST chunking failed for {file_path}, falling back: {e}")
+                            chunks = self.line_chunker.chunk_file(content, file_path, lang)
+                    else:
                         chunks = self.line_chunker.chunk_file(content, file_path, lang)
-                else:
-                    chunks = self.line_chunker.chunk_file(content, file_path, lang)
+                finally:
+                    # Free the raw file content — no longer needed once chunks are built
+                    del content
 
                 if not chunks:
                     continue
 
-                # Deduplicate chunks: skip if hash already seen, else record canonical path
+                # Deduplicate: use a set (no path values) to halve per-entry memory.
+                # Cap at _MAX_DEDUP_CACHE to bound total memory; excess treated as unique.
                 unique_chunks: List[CodeChunk] = []
                 for chunk in chunks:
                     chunk_hash = self._hash_chunk(chunk)
                     if chunk_hash in seen_hashes:
                         duplicate_chunks += 1
                     else:
-                        seen_hashes[chunk_hash] = chunk.path
-                        # Stamp canonical original path on the chunk so VectorStore can persist it
+                        if len(seen_hashes) < _MAX_DEDUP_CACHE:
+                            seen_hashes.add(chunk_hash)
                         chunk.original_path = chunk.path
                         unique_chunks.append(chunk)
+                del chunks
 
                 if not unique_chunks:
                     continue
 
-                # Embed in batches
+                # Embed and insert, then immediately release memory
                 try:
                     code_texts = [c.code for c in unique_chunks]
                     embeddings = self.embedder.embed_code_batch(code_texts)
+                    del code_texts
 
-                    # Generate summaries if summarizer is available
+                    # Generate summaries if summarizer is available (batch, on auto-detected device)
                     summaries = None
                     summary_embeddings = None
                     if self.summarizer:
-                        summary_texts: list[str] = []
-                        for chunk in unique_chunks:
-                            # Mitigation 7: check if chunk already has a summary
+                        codes = [c.code for c in unique_chunks]
+                        fallbacks = [
+                            " ".join(filter(None, [c.name, c.kind, c.docstring])) or c.code[:200]
+                            for c in unique_chunks
+                        ]
+                        # Reuse any summaries already in Redis to avoid re-generating
+                        for i, chunk in enumerate(unique_chunks):
                             existing = self._get_existing_summary(project_id, file_path, chunk)
                             if existing:
-                                summary_texts.append(existing)
-                            else:
-                                summary_texts.append(self._get_summary(chunk))
-                        summaries = summary_texts
-                        summary_embeddings = self.embedder.embed_batch(summary_texts)
+                                fallbacks[i] = existing
+                                codes[i] = ""  # below SUMMARIZE_MIN_CONTENT → uses fallback
+                        summaries = self.summarizer.summarize_batch(codes, fallbacks)
+                        summary_embeddings = self.embedder.embed_batch(summaries)
 
                     self.vector_store.insert_code_chunks(project_id, unique_chunks, embeddings, summaries=summaries, summary_embeddings=summary_embeddings)
                     total_files += 1
                     total_chunks += len(unique_chunks)
 
-                    if total_files % 50 == 0:
-                        logger.info(f"Progress: {total_files} files, {total_chunks} chunks, {duplicate_chunks} duplicates skipped")
+                    if progress_callback:
+                        progress_callback(file_path, len(unique_chunks))
                 except Exception as e:
                     msg = f"Failed to embed/insert {file_path}: {e}"
                     logger.error(msg, exc_info=True)
                     errors.append(msg)
+                finally:
+                    # Release embedding arrays and chunk list before moving to next file.
+                    # On MPS (Apple Silicon) also flush the device-side tensor cache.
+                    del embeddings, unique_chunks
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
         duration = time.time() - start_time
         logger.info(

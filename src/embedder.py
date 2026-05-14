@@ -42,6 +42,18 @@ class EmbeddingService:
 
         logger.info("Model loaded successfully")
 
+        # Compute model size in MB once at load time
+        param_bytes = sum(p.numel() * p.element_size() for p in self._model.parameters())
+        self._model_size_mb = param_bytes / (1024 ** 2)
+
+    @property
+    def model_name(self) -> str:
+        return settings.EMBED_MODEL
+
+    @property
+    def model_size_mb(self) -> float:
+        return self._model_size_mb
+
     def _l2_normalize(self, embeddings: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)

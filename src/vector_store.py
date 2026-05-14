@@ -174,6 +174,9 @@ class VectorStore:
 
     # ── Insert ────────────────────────────────────────────────────────────────
 
+    # Flush the Redis pipeline every N inserts to cap the in-memory command buffer.
+    _PIPELINE_FLUSH_EVERY = 100
+
     def insert_code_chunks(
         self, project_id: str, chunks: List[CodeChunk], embeddings: np.ndarray,
         summaries: Optional[List[str]] = None,
@@ -219,12 +222,14 @@ class VectorStore:
                     mapping["summary_embedding"] = summary_embeddings[idx].astype(np.float32).tobytes()
                 pipe.hset(key, mapping=mapping)
                 inserted += 1
-            if inserted % 100 == 0 and inserted > 0:
-                logger.info(f"Buffered {inserted} code chunks...")
+                if inserted % self._PIPELINE_FLUSH_EVERY == 0:
+                    pipe.execute()
+                    pipe = self.redis.pipeline()
 
-        pipe.execute()
+        if inserted % self._PIPELINE_FLUSH_EVERY != 0:
+            pipe.execute()
         self.redis.set(f"meta:{project_id}:last_indexed", int(time.time()))
-        logger.info(f"Inserted {inserted} code chunks for project '{project_id}'")
+        logger.debug(f"Inserted {inserted} code chunks for project '{project_id}'")
         return inserted
 
     def insert_doc_chunks(
@@ -253,10 +258,14 @@ class VectorStore:
                     "embedding": embeddings[idx].astype(np.float32).tobytes(),
                 })
                 inserted += 1
+                if inserted % self._PIPELINE_FLUSH_EVERY == 0:
+                    pipe.execute()
+                    pipe = self.redis.pipeline()
 
-        pipe.execute()
+        if inserted % self._PIPELINE_FLUSH_EVERY != 0:
+            pipe.execute()
         self.redis.set(f"meta:{project_id}:last_indexed", int(time.time()))
-        logger.info(f"Inserted {inserted} doc chunks for project '{project_id}'")
+        logger.debug(f"Inserted {inserted} doc chunks for project '{project_id}'")
         return inserted
 
     def get_index_age(self, project_id: str) -> Optional[str]:

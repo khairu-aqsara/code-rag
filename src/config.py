@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     EMBED_MODEL: str = "Alibaba-NLP/gte-modernbert-base"
     EMBED_DIM: int = 768
     EMBED_MAX_LENGTH: int = 2048
-    EMBED_BATCH_SIZE: int = 32
+    EMBED_BATCH_SIZE: int = 4
 
     # Chunking parameters
     CODE_CHUNK_LINES: int = 80

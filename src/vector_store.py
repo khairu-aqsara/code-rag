@@ -172,6 +172,27 @@ class VectorStore:
             pipe.execute()
         return len(keys_to_delete)
 
+    # ── File fingerprinting (incremental ingest) ──────────────────────────────
+
+    def _fp_key(self, project_id: str, file_hash: str) -> str:
+        return f"meta:{project_id}:fp:{file_hash}"
+
+    def get_file_fingerprint(self, project_id: str, file_path: str) -> Optional[str]:
+        """Return the stored MD5 of a file's content, or None if not indexed."""
+        fhash = self._file_hash(project_id, file_path)
+        val = self.redis.get(self._fp_key(project_id, fhash))
+        return val.decode() if val else None
+
+    def set_file_fingerprint(self, project_id: str, file_path: str, content_md5: str) -> None:
+        """Store the MD5 of a file's content after successful ingestion."""
+        fhash = self._file_hash(project_id, file_path)
+        self.redis.set(self._fp_key(project_id, fhash), content_md5)
+
+    def delete_file_fingerprint(self, project_id: str, file_path: str) -> None:
+        """Remove the stored fingerprint for a file (called on project delete)."""
+        fhash = self._file_hash(project_id, file_path)
+        self.redis.delete(self._fp_key(project_id, fhash))
+
     # ── Insert ────────────────────────────────────────────────────────────────
 
     # Flush the Redis pipeline every N inserts to cap the in-memory command buffer.
@@ -708,12 +729,14 @@ class VectorStore:
     # ── Delete & Stats ────────────────────────────────────────────────────────
 
     def delete_project(self, project_id: str) -> int:
-        """Delete all code and doc chunks for a project using SCAN (non-blocking)."""
+        """Delete all code/doc chunks and file fingerprints for a project."""
         total = 0
-        for prefix in [CODE_PREFIX, DOC_PREFIX]:
+        # Chunk data + file fingerprints all share the project_id namespace
+        for prefix in [CODE_PREFIX, DOC_PREFIX, f"meta:{project_id}"]:
+            pattern = f"{prefix}:{project_id}:*" if not prefix.startswith("meta:") else f"{prefix}:*"
             cursor = 0
             while True:
-                cursor, keys = self.redis.scan(cursor, match=f"{prefix}:{project_id}:*", count=100)
+                cursor, keys = self.redis.scan(cursor, match=pattern, count=100)
                 if keys:
                     pipe = self.redis.pipeline()
                     for key in keys:
@@ -722,7 +745,7 @@ class VectorStore:
                     total += len(keys)
                 if cursor == 0:
                     break
-        logger.info(f"Deleted {total} chunks for project '{project_id}'")
+        logger.info(f"Deleted {total} keys for project '{project_id}'")
         return total
 
     def get_stats(self) -> Dict:

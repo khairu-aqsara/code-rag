@@ -734,7 +734,7 @@ All settings are loaded from environment variables or `.env`:
 | `DOC_CHUNK_SIZE` | `512` | Approximate tokens per doc chunk |
 | `DEFAULT_TOP_K` | `10` | Default search result count |
 | `MAX_TOP_K` | `50` | Maximum allowed K in search requests |
-| `SKIP_FILES` | `*.test.py,*_test.py,test_*.py,conftest.py,*.min.js,*.min.css,*.map` | **Phase 2**: File patterns to skip during ingestion |
+| `SKIP_FILES` | `*.extension separated bu comma` | **Phase 2**: File patterns to skip during ingestion |
 | `BASE_PATH` | `/data` | Allowed root for ingest paths (security) |
 | `API_HOST` | `0.0.0.0` | API bind host |
 | `API_PORT` | `8000` | API port |

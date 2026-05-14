@@ -1,5 +1,10 @@
 import logging
 import os
+
+# Suppress tqdm progress bars from huggingface_hub and transformers during model downloads.
+# Must be set before any HF imports so the library picks it up at import time.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -22,15 +27,18 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
+from rich.logging import RichHandler
+
 from ..config import settings
+
+_console = Console()
 
 logging.basicConfig(
     level=logging.WARNING,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(message)s",
+    handlers=[RichHandler(console=_console, show_path=False, show_time=False, show_level=False, rich_tracebacks=True)],
 )
 logger = logging.getLogger(__name__)
-
-_console = Console()
 
 
 def _build_session_panel(embedder, redis_client, project_id: str, root_path: str, summarizer=None) -> Panel:
@@ -203,11 +211,23 @@ def ingest_code(
                 )
 
             _console.print()
-            _console.print(
-                f"[bold green]✓[/bold green] Ingested [bold]{result.total_files}[/bold] files, "
-                f"[bold]{result.total_chunks}[/bold] chunks in {result.duration_seconds:.1f}s"
-                + (f"  ([dim]{result.duplicate_chunks} duplicates skipped[/dim])" if result.duplicate_chunks else "")
-            )
+            total_processed = result.total_files + result.skipped_unchanged
+            if result.skipped_unchanged and result.total_files == 0:
+                summary = f"[bold green]✓[/bold green] Nothing changed — all [bold]{total_processed}[/bold] files up to date  [dim]{result.duration_seconds:.1f}s[/dim]"
+            elif result.skipped_unchanged:
+                summary = (
+                    f"[bold green]✓[/bold green] [bold]{total_processed}[/bold] files checked in {result.duration_seconds:.1f}s  "
+                    f"[bold]{result.total_files}[/bold] updated ([bold]{result.total_chunks}[/bold] chunks)  "
+                    f"[dim]{result.skipped_unchanged} unchanged[/dim]"
+                )
+            else:
+                summary = (
+                    f"[bold green]✓[/bold green] Ingested [bold]{result.total_files}[/bold] files, "
+                    f"[bold]{result.total_chunks}[/bold] chunks in {result.duration_seconds:.1f}s"
+                )
+            if result.duplicate_chunks:
+                summary += f"  [dim]{result.duplicate_chunks} duplicates skipped[/dim]"
+            _console.print(summary)
             if result.errors:
                 _console.print(f"[yellow]⚠ {len(result.errors)} errors[/yellow] (run with --verbose for details)")
     except Exception as e:

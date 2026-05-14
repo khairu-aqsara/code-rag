@@ -45,6 +45,7 @@ class EmbeddingService:
         # Compute model size in MB once at load time
         param_bytes = sum(p.numel() * p.element_size() for p in self._model.parameters())
         self._model_size_mb = param_bytes / (1024 ** 2)
+        self._truncation_warned = False
 
     @property
     def model_name(self) -> str:
@@ -76,8 +77,9 @@ class EmbeddingService:
             )
             encoded = {k: v.to(self.device) for k, v in encoded.items()}
 
-            if encoded["input_ids"].shape[1] >= settings.EMBED_MAX_LENGTH:
-                logger.warning(f"Batch truncated at {settings.EMBED_MAX_LENGTH} tokens (batch idx {i})")
+            if not self._truncation_warned and encoded["input_ids"].shape[1] >= settings.EMBED_MAX_LENGTH:
+                logger.warning(f"Chunks truncated at {settings.EMBED_MAX_LENGTH} tokens — raise EMBED_MAX_LENGTH in .env if needed (max 8192)")
+                self._truncation_warned = True
 
             with torch.no_grad():
                 outputs = self._model(**encoded)

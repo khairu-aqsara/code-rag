@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import logging
 import re
 import time
@@ -26,6 +27,7 @@ class IngestResult:
     total_chunks: int
     duration_seconds: float
     errors: List[str] = field(default_factory=list)
+    skipped_unchanged: int = 0
 
 
 class DocIngestor:
@@ -73,10 +75,10 @@ class DocIngestor:
         start_time = time.time()
         total_files = 0
         total_chunks = 0
+        skipped_unchanged = 0
         errors: List[str] = []
 
         expanded = self._expand_paths(file_paths)
-        logger.info(f"Ingesting {len(expanded)} doc files for project '{project_id}'")
 
         for file_path in expanded:
             try:
@@ -88,12 +90,20 @@ class DocIngestor:
                 errors.append(msg)
                 continue
 
+            # Skip if content hasn't changed since last ingest
+            content_md5 = hashlib.md5(raw_content.encode()).hexdigest()
+            if self.vector_store.get_file_fingerprint(project_id, file_path) == content_md5:
+                skipped_unchanged += 1
+                continue
+
             content = self._clean_content(raw_content, file_path)
+            del raw_content
             if not content:
                 logger.debug(f"Skipping empty file: {file_path}")
                 continue
 
             chunks = self.chunker.chunk_doc(content, source=file_path, tags=tags)
+            del content
             if not chunks:
                 continue
 
@@ -101,6 +111,7 @@ class DocIngestor:
                 texts = [c.content for c in chunks]
                 embeddings = self.embedder.embed_text_batch(texts)
                 self.vector_store.insert_doc_chunks(project_id, chunks, embeddings)
+                self.vector_store.set_file_fingerprint(project_id, file_path, content_md5)
                 total_files += 1
                 total_chunks += len(chunks)
             except Exception as e:
@@ -109,13 +120,10 @@ class DocIngestor:
                 errors.append(msg)
 
         duration = time.time() - start_time
-        logger.info(
-            f"Doc ingestion complete: {total_files} files, {total_chunks} chunks "
-            f"in {duration:.2f}s ({len(errors)} errors)"
-        )
         return IngestResult(
             total_files=total_files,
             total_chunks=total_chunks,
             duration_seconds=duration,
             errors=errors,
+            skipped_unchanged=skipped_unchanged,
         )

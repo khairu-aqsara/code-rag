@@ -55,8 +55,9 @@ class IngestResult:
     total_chunks: int
     duration_seconds: float
     errors: List[str] = field(default_factory=list)
-    skipped_files: int = 0  # files skipped by filter patterns
-    duplicate_chunks: int = 0  # chunks skipped due to deduplication
+    skipped_files: int = 0       # files skipped by filter patterns
+    duplicate_chunks: int = 0    # chunks skipped due to content deduplication
+    skipped_unchanged: int = 0   # files skipped because content hasn't changed since last ingest
 
 
 class CodeIngestor:
@@ -136,6 +137,7 @@ class CodeIngestor:
         total_files = 0
         total_chunks = 0
         skipped_files = 0
+        skipped_unchanged = 0
         duplicate_chunks = 0
         errors: List[str] = []
         # Set of chunk hashes seen so far — values omitted (vs Dict) to halve memory use.
@@ -169,6 +171,16 @@ class CodeIngestor:
                     msg = f"Cannot read {file_path}: {e}"
                     logger.warning(msg)
                     errors.append(msg)
+                    if progress_callback:
+                        progress_callback(file_path, 0)
+                    continue
+
+                # Skip if file content hasn't changed since last ingest
+                content_md5 = hashlib.md5(content.encode()).hexdigest()
+                if self.vector_store.get_file_fingerprint(project_id, file_path) == content_md5:
+                    skipped_unchanged += 1
+                    if progress_callback:
+                        progress_callback(file_path, 0)
                     continue
 
                 # Try AST-aware chunking first, fall back to line-based
@@ -187,6 +199,8 @@ class CodeIngestor:
                     del content
 
                 if not chunks:
+                    if progress_callback:
+                        progress_callback(file_path, 0)
                     continue
 
                 # Deduplicate: use a set (no path values) to halve per-entry memory.
@@ -204,6 +218,8 @@ class CodeIngestor:
                 del chunks
 
                 if not unique_chunks:
+                    if progress_callback:
+                        progress_callback(file_path, 0)
                     continue
 
                 # Embed and insert, then immediately release memory
@@ -231,6 +247,7 @@ class CodeIngestor:
                         summary_embeddings = self.embedder.embed_batch(summaries)
 
                     self.vector_store.insert_code_chunks(project_id, unique_chunks, embeddings, summaries=summaries, summary_embeddings=summary_embeddings)
+                    self.vector_store.set_file_fingerprint(project_id, file_path, content_md5)
                     total_files += 1
                     total_chunks += len(unique_chunks)
 
@@ -259,4 +276,5 @@ class CodeIngestor:
             errors=errors,
             skipped_files=skipped_files,
             duplicate_chunks=duplicate_chunks,
+            skipped_unchanged=skipped_unchanged,
         )
